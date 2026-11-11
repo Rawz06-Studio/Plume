@@ -1,13 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod http;
+mod menu;
 mod store;
 mod ui;
 mod updater;
 
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, Frame, Key, Layout, Margin, Modifiers, Rect, RichText, Stroke, vec2,
+    self, Align, Color32, CornerRadius, Frame, Key, Layout, Margin, Rect, RichText, Stroke, Vec2, vec2,
 };
+use menu::Action;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
@@ -88,6 +90,15 @@ struct App {
     resp_tab: RespTab,
     show_envs: bool,
     show_settings: bool,
+    show_about: bool,
+    /// Where each secondary window opens (computed once, when it is opened).
+    window_pos: HashMap<&'static str, egui::Pos2>,
+    /// When each secondary window appeared: it is repainted for a moment, because macOS
+    /// may show a new window after its first frame was drawn (leaving it blank).
+    window_opened: HashMap<&'static str, Instant>,
+    icon: Option<egui::TextureHandle>,
+    #[cfg(target_os = "macos")]
+    native_menu: menu::NativeMenu,
     edit_env: usize,
     confirm_delete: bool,
     message: Option<(String, bool, Instant)>,
@@ -122,6 +133,12 @@ impl App {
             resp_tab: RespTab::Body,
             show_envs: false,
             show_settings: false,
+            show_about: false,
+            window_pos: HashMap::new(),
+            window_opened: HashMap::new(),
+            icon: None,
+            #[cfg(target_os = "macos")]
+            native_menu: menu::NativeMenu::install(ctx),
             edit_env: 0,
             confirm_delete: false,
             message: None,
@@ -145,6 +162,7 @@ impl App {
             app.send(ctx);
             app.show_settings = std::env::var("PLUME_DEBUG_SETTINGS").is_ok();
             app.show_envs = std::env::var("PLUME_DEBUG_ENVS").is_ok();
+            app.show_about = std::env::var("PLUME_DEBUG_ABOUT").is_ok();
             if std::env::var("PLUME_DEBUG_HEADERS").is_ok() {
                 app.req_tab = ReqTab::Headers;
                 app.resp_tab = RespTab::Headers;
@@ -406,9 +424,6 @@ impl App {
         let inner = rect.shrink2(vec2(16.0, 0.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(inner).layout(Layout::right_to_left(Align::Center)), |ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            if w::icon_button(ui, Icon::Gear, "Settings  ⌘,").clicked() {
-                self.show_settings = true;
-            }
             self.env_picker(ui);
             ui.add_space(6.0);
 
@@ -421,9 +436,7 @@ impl App {
                     self.confirm_delete = true;
                 }
                 if w::icon_button(ui, Icon::Copy, "Duplicate").clicked() {
-                    let mut copy = self.cur.clone();
-                    copy.name = format!("{} copy", copy.name);
-                    self.new_request(Some(copy));
+                    self.duplicate();
                 }
             }
             let dirty = self.is_dirty(&self.cur);
@@ -464,7 +477,7 @@ impl App {
             }
             ui.separator();
             if ui.selectable_label(false, "Manage environments…").clicked() {
-                self.show_envs = true;
+                self.open_window(ui.ctx(), Action::Environments);
             }
         });
         if before != self.envs.active {
@@ -497,7 +510,7 @@ impl App {
                     self.restart(&ctx);
                 }
             }
-            Update::Failed(e) if !self.show_settings => {
+            Update::Failed(e) if !self.show_settings && !self.show_about => {
                 ui.label(RichText::new("Update failed").size(12.0).color(p.red)).on_hover_text(e);
             }
             _ => {}
@@ -571,10 +584,8 @@ impl App {
             w::segmented(ui, &mut self.req_tab, &[(ReqTab::Body, "Body".into()), (ReqTab::Headers, headers)]);
             if self.req_tab == ReqTab::Body && !self.cur.body.is_empty() {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if w::button(ui, "Format JSON", None, true).clicked()
-                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&self.cur.body)
-                    {
-                        self.cur.body = serde_json::to_string_pretty(&v).unwrap();
+                    if w::button(ui, "Format JSON", None, true).clicked() {
+                        self.format_json();
                     }
                 });
             }
@@ -676,101 +687,130 @@ impl App {
 
     // ---------- Windows ----------
 
-    fn envs_window(&mut self, ctx: &egui::Context) {
-        if !self.show_envs {
+    // ---------- Actions ----------
+
+    fn act(&mut self, action: Action, ctx: &egui::Context) {
+        match action {
+            Action::About | Action::Settings | Action::Environments => self.open_window(ctx, action),
+            Action::CheckUpdates => {
+                self.open_window(ctx, Action::About);
+                if matches!(self.update, Update::Failed(_) | Update::UpToDate) {
+                    self.update = Update::Idle;
+                }
+                self.check_updates(ctx, true);
+            }
+            Action::NewRequest => self.new_request(None),
+            Action::Save => {
+                if self.is_dirty(&self.cur) {
+                    self.save();
+                }
+            }
+            Action::Duplicate => self.duplicate(),
+            Action::Delete => {
+                if !self.cur.id.is_empty() {
+                    self.confirm_delete = true; // confirmed with the toolbar button
+                }
+            }
+            Action::Send => self.send(ctx),
+            Action::FormatJson => self.format_json(),
+            Action::GitHub => ctx.open_url(egui::OpenUrl::new_tab(format!("https://github.com/{}", updater::REPO))),
+            Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    fn menu_state(&self) -> menu::Enabled {
+        menu::Enabled {
+            save: self.is_dirty(&self.cur),
+            saved_request: !self.cur.id.is_empty(),
+            send: self.pending.is_none() && !self.cur.url.trim().is_empty(),
+        }
+    }
+
+    fn duplicate(&mut self) {
+        if self.cur.id.is_empty() {
             return;
         }
-        let before = self.envs.clone();
-        let mut open = true;
-        egui::Window::new("Environments")
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
-            .default_width(560.0)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                let p = pal(ui);
-                ui.horizontal(|ui| {
-                    if !self.envs.envs.is_empty() {
-                        self.edit_env = self.edit_env.min(self.envs.envs.len() - 1);
-                        egui::ComboBox::from_id_salt("edit_env")
-                            .icon(w::chevron)
-                            .width(180.0)
-                            .selected_text(&self.envs.envs[self.edit_env].name)
-                            .show_ui(ui, |ui| {
-                                for (i, e) in self.envs.envs.iter().enumerate() {
-                                    ui.selectable_value(&mut self.edit_env, i, &e.name);
-                                }
-                            });
-                    }
-                    if w::button(ui, "New environment", Some(Icon::Plus), true).clicked() {
-                        let n = self.envs.envs.len() + 1;
-                        self.envs.envs.push(Env { name: format!("env{n}"), vars: vec![Var::default()] });
-                        self.edit_env = self.envs.envs.len() - 1;
-                    }
-                });
-                if self.envs.envs.is_empty() {
-                    ui.add_space(8.0);
-                    ui.label(
-                        RichText::new(
-                            "Create an environment (local, staging, prod…), then use {{name}} in the URL, headers or body.",
-                        )
-                        .color(p.weak),
-                    );
-                    return;
-                }
-                ui.add_space(10.0);
-                let i = self.edit_env;
-                let old_name = self.envs.envs[i].name.clone();
-                let mut remove_env = false;
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Name").color(p.weak));
-                    ui.add(w::text_field(&mut self.envs.envs[i].name).desired_width(220.0));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if w::icon_button(ui, Icon::Trash, "Delete environment").clicked() {
-                            remove_env = true;
-                        }
-                    });
-                });
-                if self.envs.active.as_deref() == Some(old_name.as_str()) && self.envs.envs[i].name != old_name {
-                    self.envs.active = Some(self.envs.envs[i].name.clone());
-                }
-                ui.add_space(10.0);
-                w::caption(ui, "Variables");
-                let vars = &mut self.envs.envs[i].vars;
-                let mut remove = None;
-                for (j, v) in vars.iter_mut().enumerate() {
-                    ui.horizontal(|ui| {
-                        let avail = ui.available_width() - 28.0 - 2.0 * ui.spacing().item_spacing.x;
-                        ui.add(
-                            w::text_field(&mut v.key).hint_text("name").font(egui::TextStyle::Monospace).desired_width(avail * 0.35),
-                        );
-                        ui.add(
-                            w::text_field(&mut v.value)
-                                .hint_text("value")
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(avail * 0.65),
-                        );
-                        if w::icon_button(ui, Icon::Close, "Remove").clicked() {
-                            remove = Some(j);
-                        }
-                    });
-                }
-                if let Some(j) = remove {
-                    vars.remove(j);
-                }
-                ui.add_space(4.0);
-                if w::button(ui, "Add variable", Some(Icon::Plus), true).clicked() {
-                    vars.push(Var::default());
-                }
-                if remove_env {
-                    let removed = self.envs.envs.remove(i);
-                    if self.envs.active.as_deref() == Some(removed.name.as_str()) {
-                        self.envs.active = None;
-                    }
-                    self.edit_env = 0;
-                }
+        let mut copy = self.cur.clone();
+        copy.name = format!("{} copy", copy.name);
+        self.new_request(Some(copy));
+    }
+
+    fn format_json(&mut self) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&self.cur.body) {
+            self.cur.body = serde_json::to_string_pretty(&v).unwrap();
+        }
+    }
+
+    // ---------- Secondary windows (real OS windows) ----------
+
+    fn open_window(&mut self, ctx: &egui::Context, which: Action) {
+        let (key, size, _) = window_spec(which);
+        // Centered over the main window, computed once so it doesn't follow it around.
+        if let Some(main) = ctx.input(|i| i.viewport().outer_rect) {
+            let pos = main.center() - Vec2::from(size) / 2.0 - vec2(0.0, 40.0);
+            self.window_pos.insert(key, pos.max(main.min));
+        }
+        match which {
+            Action::About => self.show_about = true,
+            Action::Settings => self.show_settings = true,
+            Action::Environments => self.show_envs = true,
+            _ => {}
+        }
+        ctx.send_viewport_cmd_to(egui::ViewportId::from_hash_of(key), egui::ViewportCommand::Focus);
+    }
+
+    fn windows(&mut self, ctx: &egui::Context) {
+        for which in [Action::Settings, Action::About, Action::Environments] {
+            let open = match which {
+                Action::About => self.show_about,
+                Action::Settings => self.show_settings,
+                _ => self.show_envs,
+            };
+            let (key, size, resizable) = window_spec(which);
+            if !open {
+                self.window_opened.remove(key);
+                continue;
+            }
+            if self.window_opened.entry(key).or_insert_with(Instant::now).elapsed() < Duration::from_secs(1) {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+            let mut builder = egui::ViewportBuilder::default()
+                .with_title(key)
+                .with_inner_size(size)
+                .with_resizable(resizable)
+                .with_minimize_button(false)
+                .with_maximize_button(false);
+            if resizable {
+                builder = builder.with_min_inner_size([size[0] * 0.8, size[1] * 0.7]);
+            }
+            if let Some(pos) = self.window_pos.get(key) {
+                builder = builder.with_position(*pos);
+            }
+            let close = ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(key), builder, |ui, _| {
+                let fill = ui.visuals().window_fill;
+                egui::CentralPanel::default().frame(Frame::new().fill(fill).inner_margin(Margin::same(20))).show(
+                    ui,
+                    |ui| match which {
+                        Action::About => self.about_content(ui),
+                        Action::Settings => self.settings_content(ui),
+                        _ => self.envs_content(ui),
+                    },
+                );
+                ui.input(|i| i.viewport().close_requested() || i.key_pressed(Key::Escape))
             });
-        self.show_envs = open;
+            if close {
+                match which {
+                    Action::About => self.show_about = false,
+                    Action::Settings => self.show_settings = false,
+                    _ => self.show_envs = false,
+                }
+            }
+        }
+    }
+
+    fn envs_content(&mut self, ui: &mut egui::Ui) {
+        let before = self.envs.clone();
+        self.envs_editor(ui);
         if self.envs != before
             && let Err(e) = self.store.save_envs(&self.envs)
         {
@@ -778,85 +818,237 @@ impl App {
         }
     }
 
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        if !self.show_settings {
+    fn envs_editor(&mut self, ui: &mut egui::Ui) {
+        let p = pal(ui);
+        ui.horizontal(|ui| {
+            if !self.envs.envs.is_empty() {
+                self.edit_env = self.edit_env.min(self.envs.envs.len() - 1);
+                egui::ComboBox::from_id_salt("edit_env")
+                    .icon(w::chevron)
+                    .width(180.0)
+                    .selected_text(&self.envs.envs[self.edit_env].name)
+                    .show_ui(ui, |ui| {
+                        for (i, e) in self.envs.envs.iter().enumerate() {
+                            ui.selectable_value(&mut self.edit_env, i, &e.name);
+                        }
+                    });
+            }
+            if w::button(ui, "New environment", Some(Icon::Plus), true).clicked() {
+                let n = self.envs.envs.len() + 1;
+                self.envs.envs.push(Env { name: format!("env{n}"), vars: vec![Var::default()] });
+                self.edit_env = self.envs.envs.len() - 1;
+            }
+        });
+        if self.envs.envs.is_empty() {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "Create an environment (local, staging, prod…), then use {{name}} in the URL, headers or body.",
+                )
+                .color(p.weak),
+            );
             return;
         }
-        let before = self.settings.clone();
-        let mut open = true;
-        let mut check_now = false;
-        egui::Window::new("Settings")
-            .open(&mut open)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
-            .default_width(420.0)
-            .resizable(false)
-            .collapsible(false)
-            .show(ctx, |ui| {
-                let p = pal(ui);
-                egui::Grid::new("settings").num_columns(2).spacing([20.0, 14.0]).show(ui, |ui| {
-                    ui.label(RichText::new("Appearance").color(p.weak));
-                    w::segmented(
-                        ui,
-                        &mut self.settings.theme,
-                        &[(Theme::Auto, "Auto".into()), (Theme::Light, "Light".into()), (Theme::Dark, "Dark".into())],
-                    );
-                    ui.end_row();
-
-                    ui.label(RichText::new("Updates").color(p.weak));
-                    ui.horizontal(|ui| {
-                        w::checkbox(ui, &mut self.settings.check_updates);
-                        ui.label("Check on startup");
-                    });
-                    ui.end_row();
-
-                    ui.label(RichText::new("Version").color(p.weak));
-                    ui.horizontal(|ui| {
-                        ui.label(updater::VERSION);
-                        match &self.update {
-                            Update::Checking { manual: true } => {
-                                ui.spinner();
-                            }
-                            Update::UpToDate => {
-                                ui.label(RichText::new("Up to date").color(p.green));
-                            }
-                            Update::Available(rel) => {
-                                ui.label(RichText::new(format!("{} available", rel.version)).color(p.accent));
-                            }
-                            Update::Failed(e) => {
-                                ui.label(RichText::new("Check failed").color(p.red)).on_hover_text(e);
-                            }
-                            _ => {}
-                        }
-                        if w::button(ui, "Check now", None, true).clicked() {
-                            check_now = true;
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label(RichText::new("Data").color(p.weak));
-                    let path = self.store.root().display().to_string();
-                    ui.add(egui::Label::new(RichText::new(&path).monospace().size(11.5)).truncate())
-                        .on_hover_text(path);
-                    ui.end_row();
-                });
-                ui.add_space(10.0);
-                ui.hyperlink_to("Plume on GitHub", format!("https://github.com/{}", updater::REPO));
+        ui.add_space(10.0);
+        let i = self.edit_env;
+        let old_name = self.envs.envs[i].name.clone();
+        let mut remove_env = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Name").color(p.weak));
+            ui.add(w::text_field(&mut self.envs.envs[i].name).desired_width(220.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if w::icon_button(ui, Icon::Trash, "Delete environment").clicked() {
+                    remove_env = true;
+                }
             });
-        self.show_settings = open;
+        });
+        if self.envs.active.as_deref() == Some(old_name.as_str()) && self.envs.envs[i].name != old_name {
+            self.envs.active = Some(self.envs.envs[i].name.clone());
+        }
+        ui.add_space(10.0);
+        w::caption(ui, "Variables");
+        let vars = &mut self.envs.envs[i].vars;
+        let mut remove = None;
+        for (j, v) in vars.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                let avail = ui.available_width() - 28.0 - 2.0 * ui.spacing().item_spacing.x;
+                ui.add(
+                    w::text_field(&mut v.key)
+                        .hint_text("name")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(avail * 0.35),
+                );
+                ui.add(
+                    w::text_field(&mut v.value)
+                        .hint_text("value")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(avail * 0.65),
+                );
+                if w::icon_button(ui, Icon::Close, "Remove").clicked() {
+                    remove = Some(j);
+                }
+            });
+        }
+        if let Some(j) = remove {
+            vars.remove(j);
+        }
+        ui.add_space(4.0);
+        if w::button(ui, "Add variable", Some(Icon::Plus), true).clicked() {
+            vars.push(Var::default());
+        }
+        if remove_env {
+            let removed = self.envs.envs.remove(i);
+            if self.envs.active.as_deref() == Some(removed.name.as_str()) {
+                self.envs.active = None;
+            }
+            self.edit_env = 0;
+        }
+    }
+
+    fn settings_content(&mut self, ui: &mut egui::Ui) {
+        let before = self.settings.clone();
+        let mut check_now = false;
+        let p = pal(ui);
+        egui::Grid::new("settings").num_columns(2).spacing([20.0, 14.0]).show(ui, |ui| {
+            ui.label(RichText::new("Appearance").color(p.weak));
+            w::segmented(
+                ui,
+                &mut self.settings.theme,
+                &[(Theme::Auto, "Auto".into()), (Theme::Light, "Light".into()), (Theme::Dark, "Dark".into())],
+            );
+            ui.end_row();
+
+            ui.label(RichText::new("Updates").color(p.weak));
+            ui.horizontal(|ui| {
+                w::checkbox(ui, &mut self.settings.check_updates);
+                ui.label("Check on startup");
+            });
+            ui.end_row();
+
+            ui.label(RichText::new("Version").color(p.weak));
+            ui.horizontal(|ui| {
+                ui.label(updater::VERSION);
+                match &self.update {
+                    Update::Checking { manual: true } => {
+                        ui.spinner();
+                    }
+                    Update::UpToDate => {
+                        ui.label(RichText::new("Up to date").color(p.green));
+                    }
+                    Update::Available(rel) => {
+                        ui.label(RichText::new(format!("{} available", rel.version)).color(p.accent));
+                    }
+                    Update::Failed(e) => {
+                        ui.label(RichText::new("Check failed").color(p.red)).on_hover_text(e);
+                    }
+                    _ => {}
+                }
+                if w::button(ui, "Check now", None, true).clicked() {
+                    check_now = true;
+                }
+            });
+            ui.end_row();
+
+            ui.label(RichText::new("Data").color(p.weak));
+            let path = self.store.root().display().to_string();
+            ui.add(egui::Label::new(RichText::new(&path).monospace().size(11.5)).truncate()).on_hover_text(path);
+            ui.end_row();
+        });
+        ui.add_space(10.0);
+        ui.hyperlink_to("Plume on GitHub", format!("https://github.com/{}", updater::REPO));
+        let ctx = ui.ctx().clone();
         if check_now {
             if matches!(self.update, Update::Failed(_) | Update::UpToDate) {
                 self.update = Update::Idle;
             }
-            self.check_updates(ctx, true);
+            self.check_updates(&ctx, true);
         }
         if self.settings != before {
             if self.settings.theme != before.theme {
-                self.apply_theme(ctx);
+                self.apply_theme(&ctx);
             }
             if let Err(e) = self.store.save_settings(&self.settings) {
                 self.flash(format!("Could not save settings: {e}"), true);
             }
         }
+    }
+
+    fn about_content(&mut self, ui: &mut egui::Ui) {
+        let p = pal(ui);
+        let icon = self.icon.get_or_insert_with(|| {
+            let data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).unwrap_or_default();
+            let image =
+                egui::ColorImage::from_rgba_unmultiplied([data.width as usize, data.height as usize], &data.rgba);
+            ui.ctx().load_texture("plume-icon", image, egui::TextureOptions::LINEAR)
+        });
+        let icon = (icon.id(), vec2(96.0, 96.0));
+        let ctx = ui.ctx().clone();
+        ui.vertical_centered(|ui| {
+            ui.add_space(4.0);
+            ui.add(egui::Image::new(icon));
+            ui.add_space(6.0);
+            ui.label(RichText::new("Plume").size(22.0).strong());
+            ui.label(RichText::new(format!("Version {}", updater::VERSION)).color(p.weak));
+            ui.add_space(10.0);
+            ui.label(RichText::new("A tiny, native REST client.\nNo Electron, no account, no cloud.").color(p.text));
+            ui.add_space(14.0);
+            match &self.update {
+                Update::Checking { .. } => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Checking for updates…").color(p.weak));
+                    });
+                }
+                Update::UpToDate => {
+                    ui.label(RichText::new("Plume is up to date.").color(p.green));
+                }
+                Update::Available(rel) => {
+                    let rel = rel.clone();
+                    if w::accent_button(ui, &format!("Update to {}", rel.version), Some(Icon::Download), true).clicked()
+                    {
+                        match rel.asset_url {
+                            Some(url) => self.install_update(&ctx, url),
+                            None => ctx.open_url(egui::OpenUrl::new_tab(&rel.page_url)),
+                        }
+                    }
+                }
+                Update::Installing => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("Updating…").color(p.weak));
+                    });
+                }
+                Update::Installed => {
+                    if w::accent_button(ui, "Restart to update", None, true).clicked() {
+                        self.restart(&ctx);
+                    }
+                }
+                Update::Failed(e) => {
+                    ui.label(RichText::new("Could not check for updates.").color(p.red)).on_hover_text(e);
+                }
+                Update::Idle => {
+                    if w::button(ui, "Check for Updates", None, true).clicked() {
+                        self.check_updates(&ctx, true);
+                    }
+                }
+            }
+            ui.add_space(14.0);
+            // Center the two links: measure them first.
+            let font = egui::TextStyle::Body.resolve(ui.style());
+            let width: f32 = ["GitHub", "·", "MIT License"]
+                .iter()
+                .map(|t| ui.painter().layout_no_wrap(t.to_string(), font.clone(), p.text).size().x)
+                .sum::<f32>()
+                + 2.0 * ui.spacing().item_spacing.x;
+            ui.horizontal(|ui| {
+                ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+                ui.hyperlink_to("GitHub", format!("https://github.com/{}", updater::REPO));
+                ui.label(RichText::new("·").color(p.weak));
+                ui.hyperlink_to("MIT License", format!("https://github.com/{}/blob/main/LICENSE", updater::REPO));
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new("© 2026 Rawz06 Studio").size(11.0).color(p.weak));
+        });
     }
 }
 
@@ -877,28 +1069,24 @@ impl eframe::App for App {
         }
         let _ = &frame;
 
-        let (send, save, new, settings) = ctx.input_mut(|i| {
-            (
-                i.consume_key(Modifiers::COMMAND, Key::Enter),
-                i.consume_key(Modifiers::COMMAND, Key::S),
-                i.consume_key(Modifiers::COMMAND, Key::N),
-                i.consume_key(Modifiers::COMMAND, Key::Comma),
-            )
-        });
-        if send {
-            self.send(&ctx);
-        }
-        if save && self.is_dirty(&self.cur) {
-            self.save();
-        }
-        if new {
-            self.new_request(None);
-        }
-        if settings {
-            self.show_settings = !self.show_settings;
+        let mut actions: Vec<Action> = ctx.input_mut(|i| std::iter::from_fn(|| Action::from_keys(i)).collect());
+        #[cfg(target_os = "macos")]
+        {
+            actions.extend(std::iter::from_fn(|| self.native_menu.poll()));
+            self.native_menu.set_enabled(self.menu_state());
         }
 
         let p = pal(ui);
+        if !cfg!(target_os = "macos") {
+            let state = self.menu_state();
+            egui::Panel::top("menubar")
+                .frame(Frame::new().fill(p.sidebar).inner_margin(Margin::symmetric(8, 3)))
+                .show(ui, |ui| actions.extend(menu::in_window_bar(ui, state)));
+        }
+        for action in actions {
+            self.act(action, &ctx);
+        }
+
         egui::Panel::left("sidebar")
             .resizable(true)
             .default_size(250.0)
@@ -943,12 +1131,20 @@ impl eframe::App for App {
             });
         });
 
-        self.envs_window(&ctx);
-        self.settings_window(&ctx);
+        self.windows(&ctx);
     }
 }
 
 // ---------- Helpers ----------
+
+/// Title (also the window id), inner size and resizability of each secondary window.
+fn window_spec(which: Action) -> (&'static str, [f32; 2], bool) {
+    match which {
+        Action::About => ("About Plume", [340.0, 380.0], false),
+        Action::Settings => ("Settings", [480.0, 260.0], false),
+        _ => ("Environments", [620.0, 420.0], true),
+    }
+}
 
 fn code_frame(p: &Palette) -> Frame {
     Frame::new()

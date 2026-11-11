@@ -78,9 +78,14 @@ On Linux you may need: `libxkbcommon-dev libwayland-dev libxcb-render0-dev libxc
 | Shortcut | Action |
 | --- | --- |
 | <kbd>⌘</kbd> <kbd>↵</kbd> | Send request |
-| <kbd>⌘</kbd> <kbd>S</kbd> | Save request |
 | <kbd>⌘</kbd> <kbd>N</kbd> | New request |
+| <kbd>⌘</kbd> <kbd>S</kbd> | Save request |
+| <kbd>⌘</kbd> <kbd>D</kbd> | Duplicate request |
+| <kbd>⌘</kbd> <kbd>E</kbd> | Environments |
+| <kbd>⇧</kbd> <kbd>⌘</kbd> <kbd>F</kbd> | Format JSON body |
 | <kbd>⌘</kbd> <kbd>,</kbd> | Settings |
+
+Every action is also in the menus: the native menu bar on macOS (**Plume**, **File**, **Request**, **Window**, **Help**), and a **File · Request · Help** bar at the top of the window on Windows and Linux. Settings, Environments and About open in their own windows.
 
 On Linux and Windows, use <kbd>Ctrl</kbd> instead of <kbd>⌘</kbd>.
 

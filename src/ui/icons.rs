@@ -1,13 +1,12 @@
 //! Small line icons drawn with the painter (no icon font needed, crisp at any scale).
 
-use eframe::egui::{Color32, CornerRadius, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2, pos2, vec2};
+use eframe::egui::{Color32, CornerRadius, Painter, Pos2, Rect, Shape, Stroke, StrokeKind, pos2, vec2};
 
 #[derive(Clone, Copy)]
 pub enum Icon {
     Plus,
     Close,
     Search,
-    Gear,
     Copy,
     Trash,
     Check,
@@ -35,16 +34,6 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::Search => {
             painter.circle_stroke(p(7.0, 7.0), 4.2 * s, stroke);
             line(p(10.2, 10.2), p(13.5, 13.5));
-        }
-        Icon::Gear => {
-            let c = p(8.0, 8.0);
-            for i in 0..8 {
-                let a = i as f32 * std::f32::consts::TAU / 8.0;
-                let d = Vec2::angled(a);
-                painter.line_segment([c + d * 4.4 * s, c + d * 6.6 * s], Stroke::new(2.0 * s.max(1.0), color));
-            }
-            painter.circle_stroke(c, 4.4 * s, stroke);
-            painter.circle_stroke(c, 1.8 * s, stroke);
         }
         Icon::Copy => {
             let r = CornerRadius::same((2.0 * s) as u8);
