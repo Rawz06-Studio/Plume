@@ -18,6 +18,7 @@ pub enum Action {
     Quit,
 }
 
+#[cfg(target_os = "macos")]
 const ALL: [Action; 12] = [
     Action::About,
     Action::Settings,
@@ -34,6 +35,7 @@ const ALL: [Action; 12] = [
 ];
 
 impl Action {
+    #[cfg(target_os = "macos")]
     fn id(self) -> &'static str {
         match self {
             Action::About => "about",
