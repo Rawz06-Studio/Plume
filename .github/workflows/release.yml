@@ -1,17 +1,22 @@
 name: Release
 
-# Releases are made by CI only:
-#   Actions tab → Release → Run workflow → pick patch / minor / major.
-# The workflow tests, bumps Cargo.toml, commits, tags, builds every platform
-# and publishes the GitHub release with the executables.
+# Releases are made by CI only, never by hand:
+#   - every push to main that passes CI publishes a new patch release,
+#   - Actions tab → Release → Run workflow publishes a minor or major release.
+# The workflow bumps Cargo.toml, commits, tags, builds every platform and
+# publishes the GitHub release with the executables.
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
     inputs:
       bump:
         description: Version bump
         type: choice
         options: [patch, minor, major]
-        default: patch
+        default: minor
 
 permissions:
   contents: write
@@ -27,21 +32,32 @@ env:
 jobs:
   prepare:
     name: Bump version and tag
+    # Automatic run: only after a successful CI on a push to main.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.bump.outputs.tag }}
     steps:
       - name: Refuse to release from another branch
-        if: github.ref != 'refs/heads/main'
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
         run: |
           echo "::error::Releases are made from main (got ${GITHUB_REF_NAME})"
           exit 1
 
+      # Release exactly the commit CI tested.
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name == 'workflow_dispatch'
 
       - name: Test before releasing
+        if: github.event_name == 'workflow_dispatch'
         run: |
           sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
           cargo test --locked
@@ -49,7 +65,7 @@ jobs:
       - name: Bump, commit and tag
         id: bump
         run: |
-          version=$(scripts/bump-version.sh "${{ inputs.bump }}")
+          version=$(scripts/bump-version.sh "${{ inputs.bump || 'patch' }}")
           tag="v$version"
           if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
             echo "::error::Tag $tag already exists"

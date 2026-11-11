@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+    # Docs-only changes don't need CI (nor a new release).
+    paths-ignore: ["**.md", "LICENSE"]
   pull_request:
 
 env:

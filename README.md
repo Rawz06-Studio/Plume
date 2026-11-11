@@ -138,17 +138,12 @@ PLUME_DIR=./api plume
 
 ## Releasing
 
-Releases are made by GitHub Actions only — no manual tagging:
+Releases are made by GitHub Actions only — never by hand:
 
-1. Go to **Actions → Release → Run workflow**.
-2. Pick the bump: `patch` (0.1.0 → 0.1.1), `minor` (→ 0.2.0) or `major` (→ 1.0.0).
+- **Every push to `main` that passes CI** publishes a new patch release (0.1.0 → 0.1.1).
+- **Actions → Release → Run workflow** publishes a `minor` (→ 0.2.0) or `major` (→ 1.0.0) release.
 
-The workflow then:
-
-- runs the tests,
-- bumps the version in `Cargo.toml` and `Cargo.lock`, commits `Release vX.Y.Z` to `main` and tags it,
-- builds macOS (universal `.app`), Linux (x86_64, ARM64) and Windows,
-- publishes a GitHub release with the executables, checksums and generated notes.
+Each release bumps the version in `Cargo.toml` and `Cargo.lock`, commits `Release vX.Y.Z` to `main`, tags it, builds macOS (universal `.app`), Linux (x86_64, ARM64) and Windows, and publishes the executables with checksums and generated notes. Changes to Markdown files alone don't trigger a release.
 
 Installed copies of Plume pick it up on their next launch.
 
