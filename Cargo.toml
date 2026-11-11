@@ -1,6 +1,6 @@
 [package]
 name = "plume"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A tiny, native REST client. No Electron, no account, no cloud."
 license = "MIT"
