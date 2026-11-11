@@ -1,0 +1,173 @@
+name: Release
+
+# Two ways to publish a release:
+#
+# 1. Actions tab → Release → Run workflow → pick patch / minor / major.
+#    The workflow bumps Cargo.toml, commits, tags, builds and publishes.
+#
+# 2. Push a tag yourself (it must match the version in Cargo.toml):
+#      git tag v0.2.0 && git push origin v0.2.0
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  LINUX_DEPS: libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+jobs:
+  prepare:
+    name: Prepare version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to release from another branch
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Releases are made from main (got ${GITHUB_REF_NAME})"
+          exit 1
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name == 'workflow_dispatch'
+
+      - name: Test before releasing
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
+          cargo test --locked
+
+      - name: Bump, commit and tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          version=$(scripts/bump-version.sh "${{ inputs.bump }}")
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::Tag $tag already exists"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release $tag"
+          git tag "$tag"
+          git push origin HEAD:main "$tag"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Resolve tag
+        id: version
+        run: |
+          tag=${TAG:-$GITHUB_REF_NAME}
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$tag" ]; then
+            echo "::error::Tag $tag does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            asset: plume-macos-universal
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: plume-linux-x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: plume-linux-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: plume-windows-x86_64.exe
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
+
+      - name: Build (macOS universal + .app)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/plume-macos-universal \
+            target/aarch64-apple-darwin/release/plume \
+            target/x86_64-apple-darwin/release/plume
+          codesign --force --sign - dist/plume-macos-universal
+
+          version=${TAG#v}
+          app=dist/Plume.app
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp assets/icon.icns "$app/Contents/Resources/icon.icns"
+          cp dist/plume-macos-universal "$app/Contents/MacOS/plume"
+          sed "s/__VERSION__/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          codesign --force --deep --sign - "$app"
+          (cd dist && ditto -c -k --norsrc --keepParent Plume.app Plume-macos-universal.zip)
+          rm -rf "$app"
+
+      - name: Build (Linux / Windows)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+          mkdir -p dist
+          bin=target/${{ matrix.target }}/release/plume
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
+          cp "$bin" "dist/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release with the executables
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          gh release create "$TAG" * \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Plume $TAG" \
+            --generate-notes
