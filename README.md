@@ -138,7 +138,7 @@ PLUME_DIR=./api plume
 
 ## Releasing
 
-Releases are fully automated by GitHub Actions:
+Releases are made by GitHub Actions only — no manual tagging:
 
 1. Go to **Actions → Release → Run workflow**.
 2. Pick the bump: `patch` (0.1.0 → 0.1.1), `minor` (→ 0.2.0) or `major` (→ 1.0.0).
@@ -151,16 +151,6 @@ The workflow then:
 - publishes a GitHub release with the executables, checksums and generated notes.
 
 Installed copies of Plume pick it up on their next launch.
-
-<details>
-<summary>Releasing by hand</summary>
-
-Bump the version yourself with `scripts/bump-version.sh patch|minor|major`, commit, then push a matching tag:
-
-```bash
-git tag v0.2.0 && git push origin v0.2.0
-```
-</details>
 
 ## Icon
 

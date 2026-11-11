@@ -80,9 +80,28 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let server = std::thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
+            // Read the whole request (headers + body) before answering: closing a socket
+            // with unread data makes Windows reset the connection.
+            let mut data = Vec::new();
             let mut buf = [0u8; 4096];
-            let n = s.read(&mut buf).unwrap();
-            let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&data).to_lowercase();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                    if data.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let raw = String::from_utf8_lossy(&data).to_string();
             let body = "{\"ok\":true}";
             write!(
                 s,

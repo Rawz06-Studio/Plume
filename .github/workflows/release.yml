@@ -1,12 +1,9 @@
 name: Release
 
-# Two ways to publish a release:
-#
-# 1. Actions tab → Release → Run workflow → pick patch / minor / major.
-#    The workflow bumps Cargo.toml, commits, tags, builds and publishes.
-#
-# 2. Push a tag yourself (it must match the version in Cargo.toml):
-#      git tag v0.2.0 && git push origin v0.2.0
+# Releases are made by CI only:
+#   Actions tab → Release → Run workflow → pick patch / minor / major.
+# The workflow tests, bumps Cargo.toml, commits, tags, builds every platform
+# and publishes the GitHub release with the executables.
 on:
   workflow_dispatch:
     inputs:
@@ -15,8 +12,6 @@ on:
         type: choice
         options: [patch, minor, major]
         default: patch
-  push:
-    tags: ["v*"]
 
 permissions:
   contents: write
@@ -31,30 +26,28 @@ env:
 
 jobs:
   prepare:
-    name: Prepare version
+    name: Bump version and tag
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.version.outputs.tag }}
+      tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
-
       - name: Refuse to release from another branch
-        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        if: github.ref != 'refs/heads/main'
         run: |
           echo "::error::Releases are made from main (got ${GITHUB_REF_NAME})"
           exit 1
 
+      - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
-        if: github.event_name == 'workflow_dispatch'
 
       - name: Test before releasing
-        if: github.event_name == 'workflow_dispatch'
         run: |
           sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
           cargo test --locked
 
       - name: Bump, commit and tag
-        if: github.event_name == 'workflow_dispatch'
+        id: bump
         run: |
           version=$(scripts/bump-version.sh "${{ inputs.bump }}")
           tag="v$version"
@@ -67,17 +60,6 @@ jobs:
           git commit -am "Release $tag"
           git tag "$tag"
           git push origin HEAD:main "$tag"
-          echo "TAG=$tag" >> "$GITHUB_ENV"
-
-      - name: Resolve tag
-        id: version
-        run: |
-          tag=${TAG:-$GITHUB_REF_NAME}
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [ "v$version" != "$tag" ]; then
-            echo "::error::Tag $tag does not match Cargo.toml version $version"
-            exit 1
-          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "Releasing $tag" >> "$GITHUB_STEP_SUMMARY"
 
