@@ -11,6 +11,8 @@ pub struct Outgoing {
 }
 
 pub struct Response {
+    /// The URL that was requested (used as the base URL of HTML previews).
+    pub url: String,
     pub status: u16,
     pub reason: String,
     pub headers: Vec<(String, String)>,
@@ -61,6 +63,7 @@ pub fn send(req: Outgoing) -> Result<Response, String> {
     let body = resp.body_mut().with_config().limit(MAX_BODY).read_to_vec().map_err(|e| e.to_string())?;
 
     Ok(Response {
+        url,
         status: status.as_u16(),
         reason: status.canonical_reason().unwrap_or("").to_string(),
         headers,

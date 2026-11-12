@@ -23,7 +23,11 @@ Postman and friends grew into platforms: workspaces, sync, sign-in walls, AI sid
 
 ## Features
 
-- **Requests** — method, URL, headers, body. Response status, timing, size, pretty-printed JSON and headers.
+- **Requests** — method, URL, headers, body. Response status, timing, size and headers.
+- **Response viewer** — picked from the `Content-Type`:
+  - **JSON**: a collapsible tree (right-click a value to copy it or its path, e.g. `.data[0].email`), pretty-printed with colors, or raw.
+  - **HTML**: rendered by the system webview (macOS, Windows; JavaScript off, links don't navigate), source view, or open in your browser.
+  - **Images** shown as images; **XML** and text highlighted; anything else as a hex dump.
 - **Saved requests** — a flat, searchable list. One readable JSON file per request, easy to commit with your project.
 - **Environments** — `local`, `staging`, `prod`… with simple `{{variable}}` substitution in the URL, headers and body.
 - **Unsaved drafts** — edit several requests, switch between them; unsaved changes are kept (marked with •) until you save.
@@ -41,7 +45,7 @@ Grab the binary for your platform from the [latest release](https://github.com/R
 | macOS (Apple Silicon & Intel) | `Plume-macos-universal.zip` (app) |
 | Linux x86_64 | `plume-linux-x86_64` |
 | Linux ARM64 | `plume-linux-aarch64` |
-| Windows x86_64 | `plume-windows-x86_64.exe` |
+| Windows x86_64 | `Plume-Setup-x86_64.exe` (installer) or `Plume-windows-x86_64.zip` (portable) |
 
 <details>
 <summary><b>macOS: “Plume can't be opened”</b></summary>
@@ -51,6 +55,14 @@ Builds are not notarized by Apple. After unzipping, remove the quarantine flag o
 ```bash
 xattr -dr com.apple.quarantine /Applications/Plume.app
 ```
+</details>
+
+<details>
+<summary><b>Windows: installer and SmartScreen</b></summary>
+
+The installer needs no admin rights: it installs Plume for the current user in `%LOCALAPPDATA%\Programs\Plume`, adds it to the Start menu and registers an uninstaller. Your requests in `%USERPROFILE%\.plume` are kept when uninstalling.
+
+Builds are not code-signed yet, so SmartScreen may show “Windows protected your PC”: click **More info** → **Run anyway**. If that button is missing, right-click the file → **Properties** → tick **Unblock**.
 </details>
 
 <details>
@@ -148,7 +160,7 @@ Releases are made by GitHub Actions only — never by hand:
 - **Every push to `main` that passes CI** publishes a new patch release (0.1.0 → 0.1.1).
 - **Actions → Release → Run workflow** publishes a `minor` (→ 0.2.0) or `major` (→ 1.0.0) release.
 
-Each release bumps the version in `Cargo.toml` and `Cargo.lock`, commits `Release vX.Y.Z` to `main`, tags it, builds macOS (universal `.app`), Linux (x86_64, ARM64) and Windows, and publishes the executables with checksums and generated notes. Changes to Markdown files alone don't trigger a release.
+Each release bumps the version in `Cargo.toml` and `Cargo.lock`, commits `Release vX.Y.Z` to `main`, tags it, builds macOS (universal `.app`), Linux (x86_64, ARM64) and Windows (installer + portable zip), and publishes the executables with checksums and generated notes. Changes to Markdown files alone don't trigger a release.
 
 Installed copies of Plume pick it up on their next launch.
 

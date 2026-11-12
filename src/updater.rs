@@ -1,8 +1,9 @@
 //! Self-update from GitHub releases.
 //!
-//! The release workflow uploads one raw binary per platform (see `asset_name`).
-//! Checking reads the latest release from the GitHub API; installing downloads the
-//! matching binary and swaps it in place of the running executable.
+//! The release workflow uploads one binary per platform (see `asset_name`): a raw
+//! executable, or on Windows a zip holding `Plume.exe`. Checking reads the latest release
+//! from the GitHub API; installing downloads the matching asset and swaps the binary in
+//! place of the running executable.
 
 use std::time::Duration;
 
@@ -26,7 +27,7 @@ pub fn asset_name() -> Option<&'static str> {
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
         Some("plume-linux-aarch64")
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-        Some("plume-windows-x86_64.exe")
+        Some("Plume-windows-x86_64.zip")
     } else {
         None
     }
@@ -77,7 +78,10 @@ pub fn install(asset_url: &str) -> Result<(), String> {
     if resp.status().as_u16() != 200 {
         return Err(format!("download failed: HTTP {}", resp.status().as_u16()));
     }
-    let bytes = resp.body_mut().with_config().limit(300 * 1024 * 1024).read_to_vec().map_err(|e| e.to_string())?;
+    let mut bytes = resp.body_mut().with_config().limit(300 * 1024 * 1024).read_to_vec().map_err(|e| e.to_string())?;
+    if asset_url.ends_with(".zip") {
+        bytes = exe_from_zip(&bytes)?;
+    }
     if bytes.len() < 100 * 1024 {
         return Err("downloaded file is too small to be a Plume binary".into());
     }
@@ -92,6 +96,22 @@ pub fn install(asset_url: &str) -> Result<(), String> {
     let result = self_replace::self_replace(&tmp).map_err(|e| format!("could not replace binary: {e}"));
     let _ = std::fs::remove_file(&tmp);
     result
+}
+
+/// Extracts the executable (the only `.exe`, or the first file) from a release zip.
+fn exe_from_zip(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
+    let names: Vec<String> = archive.file_names().filter_map(|n| n.ok().map(|n| n.into_owned())).collect();
+    let name = names
+        .iter()
+        .find(|n| n.to_ascii_lowercase().ends_with(".exe"))
+        .or_else(|| names.iter().find(|n| !n.ends_with('/')))
+        .ok_or("the update archive is empty")?;
+    let mut file = archive.by_name(name).map_err(|e| e.to_string())?;
+    let mut out = Vec::with_capacity(file.size() as usize);
+    file.read_to_end(&mut out).map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 /// Compares `x.y.z` versions (a leading `v` and any `-suffix` are ignored).
@@ -115,7 +135,7 @@ fn is_newer(candidate: &str, current: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_newer;
+    use super::{exe_from_zip, is_newer};
 
     #[test]
     fn versions() {
@@ -128,6 +148,20 @@ mod tests {
     }
 
     /// Hits the real GitHub API: `cargo test -- --ignored live_check`
+    #[test]
+    fn extracts_exe_from_zip() {
+        use std::io::Write;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("README.txt", opts).unwrap();
+        zip.write_all(b"hi").unwrap();
+        zip.start_file("Plume.exe", opts).unwrap();
+        zip.write_all(&[7u8; 4096]).unwrap();
+        zip.finish().unwrap();
+        assert_eq!(exe_from_zip(buf.get_ref()).unwrap(), vec![7u8; 4096]);
+    }
+
     #[test]
     #[ignore]
     fn live_check() {

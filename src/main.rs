@@ -2,6 +2,7 @@
 
 mod http;
 mod menu;
+mod preview;
 mod store;
 mod ui;
 mod updater;
@@ -15,16 +16,29 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 use store::{Env, Envs, Header, METHODS, Request, Settings, Store, Theme, Var};
+use ui::body::{self, Kind, View};
 use ui::icons::Icon;
 use ui::theme::{self, Palette, pal};
 use ui::widgets as w;
 
-/// Response bodies larger than this are truncated on screen (huge text edits are slow).
-const MAX_DISPLAY: usize = 2 * 1024 * 1024;
-
 /// On macOS the content extends under the title bar; leave room for the window buttons.
 const TITLEBAR_INSET: f32 = if cfg!(target_os = "macos") { 38.0 } else { 10.0 };
 const TOOLBAR_HEIGHT: f32 = 52.0;
+
+/// A REST client needs no discrete GPU. By default wgpu asks for the high-performance one,
+/// which on laptops wakes up the dedicated GPU and loads its (large) driver: prefer the
+/// integrated GPU instead, and on Windows use DirectX 12 only (the Vulkan loader pulls in
+/// every installed overlay layer). `WGPU_BACKEND` / `WGPU_POWER_PREF` still override this.
+fn gpu_options() -> eframe::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuSetup, WgpuSetupCreateNew, wgpu};
+    let mut setup = WgpuSetupCreateNew::without_display_handle();
+    setup.power_preference = wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::LowPower);
+    if cfg!(windows) {
+        setup.instance_descriptor.backends =
+            wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12 | wgpu::Backends::GL);
+    }
+    eframe::WgpuConfiguration { wgpu_setup: WgpuSetup::CreateNew(setup), ..Default::default() }
+}
 
 fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
@@ -38,7 +52,7 @@ fn main() -> eframe::Result {
     if cfg!(target_os = "macos") {
         viewport = viewport.with_fullsize_content_view(true).with_titlebar_shown(false).with_title_shown(false);
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    let options = eframe::NativeOptions { viewport, wgpu_options: gpu_options(), ..Default::default() };
     eframe::run_native("Plume", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
@@ -56,11 +70,13 @@ enum RespTab {
 
 struct Shown {
     resp: http::Response,
-    text: String,
+    body: body::Body,
+    /// Unique per response (tells the HTML preview when to reload).
+    seq: u64,
 }
 
 enum Outcome {
-    Ok(Shown),
+    Ok(Box<Shown>),
     Err(String),
 }
 
@@ -109,6 +125,13 @@ struct App {
     material_dark: Option<bool>,
     /// Share of the height given to the request editor (the response gets the rest).
     split: f32,
+    /// Body view picked for each kind of content (JSON → Tree, HTML → Preview…).
+    views: HashMap<Kind, View>,
+    seq: u64,
+    /// Where the HTML preview goes this frame (set while drawing the response).
+    preview_at: Option<Rect>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    preview: preview::Preview,
 }
 
 impl App {
@@ -147,6 +170,11 @@ impl App {
             exe: std::env::current_exe().ok(),
             material_dark: None,
             split: 0.45,
+            views: HashMap::new(),
+            seq: 0,
+            preview_at: None,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            preview: Default::default(),
         };
         app.apply_theme(ctx);
         let dark = ctx.system_theme().unwrap_or(egui::Theme::Dark) == egui::Theme::Dark;
@@ -163,6 +191,15 @@ impl App {
             app.show_settings = std::env::var("PLUME_DEBUG_SETTINGS").is_ok();
             app.show_envs = std::env::var("PLUME_DEBUG_ENVS").is_ok();
             app.show_about = std::env::var("PLUME_DEBUG_ABOUT").is_ok();
+            if let Ok(v) = std::env::var("PLUME_DEBUG_VIEW") {
+                let view = [View::Tree, View::Pretty, View::Raw, View::Preview, View::Hex]
+                    .into_iter()
+                    .find(|x| x.label() == v)
+                    .unwrap_or(View::Raw);
+                for k in [Kind::Json, Kind::Html, Kind::Xml, Kind::Text, Kind::Image, Kind::Binary] {
+                    app.views.insert(k, view);
+                }
+            }
             if std::env::var("PLUME_DEBUG_HEADERS").is_ok() {
                 app.req_tab = ReqTab::Headers;
                 app.resp_tab = RespTab::Headers;
@@ -340,8 +377,8 @@ impl App {
         let Ok(result) = rx.try_recv() else { return };
         let outcome = match result {
             Ok(resp) => {
-                let text = display_body(&resp);
-                Outcome::Ok(Shown { resp, text })
+                self.seq += 1;
+                Outcome::Ok(Box::new(Shown { body: body::Body::new(&resp), resp, seq: self.seq }))
             }
             Err(e) => Outcome::Err(e),
         };
@@ -621,7 +658,7 @@ impl App {
             });
             return;
         }
-        let Some(outcome) = self.responses.get(&self.cur.id) else {
+        let Some(outcome) = self.responses.get_mut(&self.cur.id) else {
             ui.centered_and_justified(|ui| {
                 ui.label(RichText::new("Send a request to see the response here.   ⌘↵").color(p.weak));
             });
@@ -631,13 +668,15 @@ impl App {
             Outcome::Err(e) => {
                 ui.horizontal(|ui| {
                     w::pill(ui, "Error", p.red);
-                    ui.label(RichText::new(e).color(p.text));
+                    ui.label(RichText::new(e.as_str()).color(p.text));
                 });
                 return;
             }
             Outcome::Ok(s) => s,
         };
         let r = &shown.resp;
+        let kind = shown.body.kind;
+        let view = self.views.get(&kind).copied().unwrap_or(kind.views()[0]);
         ui.horizontal(|ui| {
             w::pill(ui, &format!("{} {}", r.status, r.reason), status_color(r.status, &p));
             ui.label(RichText::new(format!("{} ms", r.elapsed.as_millis())).color(p.weak));
@@ -646,7 +685,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if w::icon_button(ui, Icon::Copy, "Copy").clicked() {
                     let text = match self.resp_tab {
-                        RespTab::Body => String::from_utf8_lossy(&r.body).into_owned(),
+                        RespTab::Body => shown.body.copy_text(view, &r.body),
                         RespTab::Headers => r.headers.iter().map(|(k, v)| format!("{k}: {v}\n")).collect(),
                     };
                     ui.ctx().copy_text(text);
@@ -657,16 +696,54 @@ impl App {
             });
         });
         ui.add_space(8.0);
+
+        if self.resp_tab == RespTab::Body && !r.body.is_empty() {
+            // Kind of content on the left, view switcher and tools on the right.
+            ui.horizontal(|ui| {
+                let label = if shown.body.media_type.is_empty() {
+                    kind.label().to_string()
+                } else {
+                    format!("{}  ·  {}", kind.label(), shown.body.media_type)
+                };
+                ui.label(RichText::new(label).size(12.0).color(p.weak));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if kind.views().len() > 1 {
+                        let mut v = view;
+                        let options: Vec<_> = kind.views().iter().map(|v| (*v, v.label().to_string())).collect();
+                        if w::segmented(ui, &mut v, &options) {
+                            self.views.insert(kind, v);
+                        }
+                    }
+                    if kind == Kind::Html
+                        && w::button(ui, "Open in Browser", None, true).clicked()
+                        && let Err(e) = preview::open_in_browser(
+                            ui.ctx(),
+                            &preview::with_base(&String::from_utf8_lossy(&r.body), &r.url),
+                        )
+                    {
+                        self.message = Some((e, true, Instant::now()));
+                    }
+                    shown.body.view_tools(ui, view);
+                });
+            });
+            ui.add_space(6.0);
+        }
+
         code_frame(&p).show(ui, |ui| match self.resp_tab {
             RespTab::Body => {
-                egui::ScrollArea::both().id_salt("resp_body").auto_shrink(false).show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut shown.text.as_str())
-                            .code_editor()
-                            .frame(Frame::NONE)
-                            .desired_width(f32::INFINITY),
-                    );
-                });
+                if let Some(rect) = shown.body.show(ui, view, &r.body) {
+                    if preview::SUPPORTED {
+                        self.preview_at = Some(rect);
+                        ui.allocate_rect(rect, egui::Sense::hover());
+                    } else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                RichText::new("No embedded preview on this platform — use Open in Browser.")
+                                    .color(p.weak),
+                            );
+                        });
+                    }
+                }
             }
             RespTab::Headers => {
                 egui::ScrollArea::vertical().id_salt("resp_headers").auto_shrink(false).show(ui, |ui| {
@@ -683,6 +760,25 @@ impl App {
                 });
             }
         });
+    }
+
+    /// Shows the native HTML preview where the response asked for it, or hides it.
+    fn sync_preview(&mut self, frame: &eframe::Frame) {
+        let at = self.preview_at.take();
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        match (at, self.responses.get(&self.cur.id)) {
+            (Some(rect), Some(Outcome::Ok(shown))) => {
+                let html = preview::with_base(&String::from_utf8_lossy(&shown.resp.body), &shown.resp.url);
+                self.preview.show(frame, rect, shown.seq, &html);
+                if let Some(e) = self.preview.error.take() {
+                    self.message = Some((format!("Preview unavailable: {e}"), true, Instant::now()));
+                    self.preview.error = Some(e);
+                }
+            }
+            _ => self.preview.hide(),
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let _ = (at, frame);
     }
 
     // ---------- Windows ----------
@@ -1131,6 +1227,7 @@ impl eframe::App for App {
             });
         });
 
+        self.sync_preview(frame);
         self.windows(&ctx);
     }
 }
@@ -1188,25 +1285,6 @@ fn headers_editor(ui: &mut egui::Ui, headers: &mut Vec<Header>) {
             headers.push(Header { enabled: true, ..Default::default() });
         }
     });
-}
-
-fn display_body(resp: &http::Response) -> String {
-    let bytes = &resp.body;
-    if bytes.is_empty() {
-        return String::new();
-    }
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes)
-        && let Ok(pretty) = serde_json::to_string_pretty(&v)
-        && pretty.len() <= MAX_DISPLAY
-    {
-        return pretty;
-    }
-    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DISPLAY)]).into_owned();
-    if bytes.len() > MAX_DISPLAY {
-        format!("{text}\n\n… truncated for display ({}). Copy copies everything.", human_size(bytes.len()))
-    } else {
-        text
-    }
 }
 
 fn method_color(m: &str, p: &Palette) -> Color32 {

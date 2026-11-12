@@ -97,7 +97,7 @@ jobs:
             asset: plume-linux-aarch64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset: plume-windows-x86_64.exe
+            asset: Plume-windows-x86_64.zip
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
     steps:
@@ -141,8 +141,26 @@ jobs:
           cargo build --release --locked --target ${{ matrix.target }}
           mkdir -p dist
           bin=target/${{ matrix.target }}/release/plume
-          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
-          cp "$bin" "dist/${{ matrix.asset }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # Plume.exe is kept for the installer; the portable build is a zip of it.
+            mkdir -p build && cp "$bin.exe" build/Plume.exe
+          else
+            cp "$bin" "dist/${{ matrix.asset }}"
+          fi
+
+      # Portable zip (also what the updater downloads) and the installer.
+      - name: Package Windows (zip + installer)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          Compress-Archive -Path build\Plume.exe -DestinationPath "dist\${{ matrix.asset }}"
+          $version = $env:TAG.TrimStart('v')
+          & $iscc /Qp "/DAppVersion=$version" "/DSourceExe=$PWD\build\Plume.exe" "/DOutputDir=$PWD\dist" packaging\windows\plume.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v7
         with:
