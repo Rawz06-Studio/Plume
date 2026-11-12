@@ -72,6 +72,7 @@ struct Shown {
     resp: http::Response,
     body: body::Body,
     /// Unique per response (tells the HTML preview when to reload).
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     seq: u64,
 }
 
